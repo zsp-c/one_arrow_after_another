@@ -108,6 +108,36 @@ def check_one(index):
     else:
         print("碰撞校验：本关开局所有箭头都畅通（无需碰撞校验）")
 
+    # --- 额外校验 1.5：自动提示功能 ---
+    # 提示会直接替玩家把箭头点掉，所以这里要确认：选中的箭头必定能飞出去、
+    # 必定不会浪费失误次数、次数用完后不再给。
+    state = LevelState(index)
+    assert state.hints_left == state.max_hints, "开局提示次数应等于上限"
+    for i in range(state.max_hints):
+        left_arrows = state.remaining
+        mistakes = state.mistakes_left
+        pos = state.use_hint()
+        assert pos is not None, "还剩 %d 次提示，应当能给出提示" % state.hints_left
+        assert pos in state.arrows, "提示应当指向棋盘上真实存在的箭头"
+        assert state.blocker_of(pos) is None, \
+            "提示给出的箭头必须是可以直接飞出棋盘的（%s 被挡住了）" % (pos,)
+        assert state.hints_left == state.max_hints - i - 1, "提示次数应逐次递减"
+
+        result = state.click(pos)                     # 自动提示做的就是这一步
+        assert result.kind == "out", \
+            "自动提示选中的箭头必须能飞出，实际是 %s" % result.kind
+        assert state.remaining == left_arrows - 1, "自动提示后箭头应当减少一支"
+        assert state.mistakes_left == mistakes, "自动提示不应消耗失误次数"
+
+    assert state.use_hint() is None, "提示次数用完后不应再给出提示"
+    assert state.hints_left == 0, "提示次数不应变成负数"
+    print("自动提示校验：连续 %d 次提示均自动飞出一支可走的箭头、且不消耗失误，"
+          "用完后不再给，通过" % state.max_hints)
+
+    # 提示必须是稳定可复现的：同一局面重复问应当给出同一支箭头
+    fresh = LevelState(index)
+    assert fresh.use_hint() == LevelState(index).use_hint(), "同一局面的提示结果应当一致"
+
     # --- 额外校验 2：重新开始必须完全复原 ---
     state = LevelState(index)
     state.click(blocked_case if blocked_case else sorted(state.arrows)[0])
@@ -117,7 +147,9 @@ def check_one(index):
     assert state.remaining == state.total, "重新开始后箭头数量应复原"
     assert state.mistakes_left == state.max_mistakes, "重新开始后失误次数应复原"
     assert state.mistakes_used == 0, "重新开始后失误计数应清零"
-    print("重开校验：箭头复原为 %d 支，失误复原为 %d 次，通过" % (state.total, state.max_mistakes))
+    assert state.hints_left == state.max_hints, "重新开始后提示次数应复原"
+    print("重开校验：箭头复原为 %d 支，失误复原为 %d 次，提示复原为 %d 次，通过"
+          % (state.total, state.max_mistakes, state.max_hints))
 
     # --- 额外校验 3：失误耗尽应当判负 ---
     state = LevelState(index)

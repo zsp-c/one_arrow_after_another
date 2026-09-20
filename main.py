@@ -440,15 +440,53 @@ class BlockerHighlight(Animation):
                          border_radius=px(14))
 
 
-class FloatText(Animation):
-    """向上飘并淡出的提示文字。"""
+class HintPulse(Animation):
+    """提示：把一支可以点掉的箭头用脉冲圆环圈出来，并画出它的前进路线。
 
-    def __init__(self, text, center, color, duration=0.9, size=26):
+    这个动画**不锁输入**（busy() 只认飞出和撞击），玩家可以立刻照着点。
+    """
+
+    def __init__(self, view, pos, cells, duration=3.0):
+        super().__init__(duration)
+        self.view = view
+        self.pos = pos
+        self.cells = cells
+
+    def draw(self, surface):
+        u = self.progress
+        alpha = 255 if u < 0.75 else int(255 * (1.0 - (u - 0.75) / 0.25))
+        if alpha <= 0:
+            return
+
+        # 顺带把这条路画成绿点，让玩家看清"为什么它能飞出去"
+        radius = max(px(5), int(self.view.cell * 0.11))
+        for cell in self.cells:
+            pygame.draw.circle(surface, GREEN, self.view.cell_rect(*cell).center, radius)
+
+        pulse = 0.5 - 0.5 * math.cos(self.t * 7.0)
+        rect = self.view.cell_rect(*self.pos).inflate(px(10) + px(10) * pulse,
+                                                      px(10) + px(10) * pulse)
+        layer = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+        color = lerp_color(GREEN, (240, 255, 245), pulse * 0.7)
+        pygame.draw.rect(layer, color + (alpha,), layer.get_rect(),
+                         width=max(2, px(4)), border_radius=px(16))
+        surface.blit(layer, rect.topleft)
+
+
+class FloatText(Animation):
+    """一边飘一边淡出的提示文字。
+
+    rise 是飘动的位移（负数表示向下飘）：靠近棋盘上边缘的格子要把字放到下方，
+    否则文字会飘出棋盘、压到顶部的关卡标题上。
+    """
+
+    def __init__(self, text, center, color, duration=0.9, size=26, rise=None):
         super().__init__(duration)
         self.text = text
         self.center = center
         self.color = color
         self.size = size
+        self.rise = px(54) if rise is None else rise
 
     def draw(self, surface):
         u = self.progress
@@ -458,7 +496,13 @@ class FloatText(Animation):
         image = get_font(self.size, True).render(self.text, True, self.color)
         image.set_alpha(alpha)
         rect = image.get_rect(center=(self.center[0],
-                                      self.center[1] - px(54) * ease_out(u)))
+                                      self.center[1] - self.rise * ease_out(u)))
+        # 垫一层半透明底色，压在其他箭头上时也能看清
+        pad_x, pad_y = px(10), px(5)
+        back = pygame.Surface((rect.w + pad_x * 2, rect.h + pad_y * 2), pygame.SRCALPHA)
+        pygame.draw.rect(back, (12, 14, 20, int(185 * alpha / 255.0)),
+                         back.get_rect(), border_radius=px(8))
+        surface.blit(back, (rect.x - pad_x, rect.y - pad_y))
         surface.blit(image, rect)
 
 
@@ -539,7 +583,8 @@ class Button:
             rect.y += px(2)
         pygame.draw.rect(surface, base, rect, border_radius=px(12))
         pygame.draw.rect(surface, edge, rect, width=max(1, px(2)), border_radius=px(12))
-        draw_text(surface, self.label, self.size, text, rect.center, anchor="center", bold=True)
+        label = self.label() if callable(self.label) else self.label
+        draw_text(surface, label, self.size, text, rect.center, anchor="center", bold=True)
 
 
 # ---------------------------------------------------------------- 游戏状态
@@ -557,6 +602,7 @@ class Game:
         self.view = None
         self.anims = []
         self.buttons = []
+        self.hint_button = None
         self.hover_pos = None
         self.pending = None            # "win" / "over"，等动画放完再切界面
         self.overlay_t = 0.0
@@ -570,6 +616,7 @@ class Game:
 
     def build_buttons(self):
         self.buttons = []
+        self.hint_button = None
         cx = WIDTH // 2
         if self.state == STATE_START:
             self.buttons.append(Button((cx - px(110), px(386), px(220), px(56)),
@@ -584,8 +631,12 @@ class Game:
                                            size=19, style="ghost"))
         elif self.state == STATE_PLAY:
             x, w = PANEL_RECT.x + px(22), PANEL_W - px(44)
+            self.hint_button = Button((x, PANEL_RECT.bottom - px(214), w, px(48)),
+                                      self.hint_label, self.use_hint, size=20)
+            self.buttons.append(self.hint_button)
             self.buttons.append(Button((x, PANEL_RECT.bottom - px(156), w, px(48)),
-                                       "重新开始本关", self.restart_level, size=20))
+                                       "重新开始本关", self.restart_level, size=20,
+                                       style="ghost"))
             self.buttons.append(Button((x, PANEL_RECT.bottom - px(98), w, px(48)),
                                        "返回主菜单", self.go_menu, size=20, style="ghost"))
         elif self.state == STATE_WIN:
@@ -658,6 +709,9 @@ class Game:
                 if self.state in (STATE_PLAY, STATE_WIN, STATE_OVER):
                     self.restart_level()
                 return
+            if event.key == pygame.K_h:
+                self.use_hint()
+                return
             if event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER):
                 if self.state == STATE_START:
                     self.start_from_scratch()
@@ -679,6 +733,47 @@ class Game:
                 if cell is not None:
                     self.click_cell(cell)
 
+    def make_float_text(self, text, cell, color, size=24):
+        """在某个格子旁边生成飘字；格子太靠上就把字改放到下方，避免飘出棋盘。"""
+        rect = self.view.cell_rect(*cell)
+        above = rect.top - px(46) >= BOARD_AREA.top
+        y = rect.top - px(34) if above else rect.bottom + px(34)
+        return FloatText(text, (rect.centerx, y), color, size=size,
+                         rise=px(30) if above else -px(30))
+
+    def hint_label(self):
+        if self.level is None:
+            return "自动提示"
+        if self.level.hints_left <= 0:
+            return "自动提示（已用完）"
+        return "自动提示（剩 %d 次）" % self.level.hints_left
+
+    def use_hint(self):
+        """花一次提示机会：自动找出一支能飞出棋盘的箭头，并直接替玩家点掉它。
+
+        因为选中的箭头一定是"前方畅通"的，这一步不会消耗失误次数。
+        """
+        if self.state != STATE_PLAY or self.level is None:
+            return
+        if self.busy() or self.pending is not None:
+            return
+
+        pos = self.level.use_hint()
+        if pos is None:
+            return
+
+        path = self.level.path_of(pos)
+        self.click_cell(pos)                 # 自动点掉，走的是和手动点击完全相同的那条路径
+
+        if pos in self.level.arrows:         # 兜底：万一没点掉，把这次机会还回去
+            self.level.hints_left += 1
+            return
+
+        # 圈出刚刚自动飞掉的那一支，并把它畅通的路线画出来解释原因。
+        # 插到列表最前面，让它画在飞出动画的下层，不挡住箭头。
+        self.anims.insert(0, HintPulse(self.view, pos, path, duration=1.1))
+        self.anims.append(self.make_float_text("提示：这一支能飞出", pos, GREEN, size=22))
+
     def click_cell(self, cell):
         if self.busy() or self.pending is not None or self.level is None:
             return
@@ -688,6 +783,9 @@ class Game:
         result = self.level.click(cell)
         if result.kind == "empty":
             return
+
+        # 棋盘一变动，之前圈出来的提示标记就作废了
+        self.anims = [a for a in self.anims if not isinstance(a, HintPulse)]
 
         if result.kind == "out":
             color = DIR_COLOR[result.direction]
@@ -699,8 +797,7 @@ class Game:
             color = DIR_COLOR[result.direction]
             self.anims.append(ShakeAnim(self.view, result.pos, result.direction, color))
             self.anims.append(BlockerHighlight(self.view, result.blocker))
-            center = self.view.center(result.pos)
-            self.anims.append(FloatText("被挡住了！", (center[0], center[1] - 10), RED, size=24))
+            self.anims.append(self.make_float_text("被挡住了！", result.pos, RED, size=24))
             if self.level.is_failed:
                 self.pending = "over"
 
@@ -725,6 +822,11 @@ class Game:
         mouse_pos = pygame.mouse.get_pos()
         for button in self.buttons:
             button.update(mouse_pos)
+        # 提示按钮：没有次数、或者动画正在播放时置灰
+        if self.state == STATE_PLAY and self.hint_button is not None:
+            self.hint_button.enabled = (self.level.hints_left > 0
+                                        and not self.busy()
+                                        and self.pending is None)
 
         if self.state == STATE_PLAY and self.view is not None:
             if self.busy():
@@ -772,9 +874,10 @@ class Game:
             "点击箭头：前方同一直线上没有别的箭头，它就飞出棋盘",
             "前方被挡住：箭头会被弹回来，并消耗一次失误机会",
             "失误用完就闯关失败；清空全部箭头即可进入下一关",
+            "卡住了就点「自动提示」（每关 2 次），直接帮你飞掉一支能走的",
         ]
         for i, line in enumerate(rules):
-            draw_text(self.screen, line, 19, TEXT_DIM, (WIDTH // 2, px(566) + i * px(30)),
+            draw_text(self.screen, line, 19, TEXT_DIM, (WIDTH // 2, px(548) + i * px(30)),
                       anchor="center")
 
     # -------- 游戏界面
@@ -944,7 +1047,7 @@ class Game:
             y += px(26)
 
         # 清空进度条
-        bar_y = PANEL_RECT.bottom - px(214)
+        bar_y = PANEL_RECT.bottom - px(256)
         label("清空进度", bar_y - px(28))
         draw_text(self.screen, "%d / %d" % (self.level.cleared, self.level.total), 18,
                   TEXT_DIM, (x + w, bar_y - px(28)), anchor="topright")
@@ -957,7 +1060,7 @@ class Game:
         pygame.draw.rect(self.screen, PANEL_EDGE, bar,
                          width=max(1, px(1)), border_radius=px(6))
 
-        footer = "点击箭头 · R 重开 · Esc 返回"
+        footer = "H 自动提示 · R 重开 · Esc 返回"
         draw_text(self.screen, footer, 16, TEXT_FAINT,
                   (PANEL_RECT.centerx, PANEL_RECT.bottom - px(24)), anchor="center")
 
@@ -1122,9 +1225,39 @@ def run_auto(scale=None):
     ok &= over_ok
     print("  失误耗尽 -> 失败界面：%s" % ("通过" if over_ok else "失败"))
 
+    # 自动提示：走真实的界面路径点两次，每次都应自动飞出一支且不消耗失误；第三次不再给
+    game.start_level(2)
+    hint_ok = True
+    for i in range(game.level.max_hints):
+        guard = 0
+        while game.busy() and guard < 600:
+            _step(game, 1.0 / 60)
+            guard += 1
+
+        before_hints = game.level.hints_left
+        before_arrows = game.level.remaining
+        before_mistakes = game.level.mistakes_left
+        game.use_hint()
+
+        flew = any(isinstance(a, FlyOutAnim) for a in game.anims)
+        if (not flew
+                or game.level.hints_left != before_hints - 1
+                or game.level.remaining != before_arrows - 1
+                or game.level.mistakes_left != before_mistakes):
+            hint_ok = False
+            break
+    game.use_hint()                       # 第 max_hints+1 次：不该再给
+    if game.level.hints_left != 0:
+        hint_ok = False
+    ok &= hint_ok
+    print("  自动提示（用 %d 次，每次都自动飞出一支、失误不变；第 %d 次不再给）：%s"
+          % (game.level.max_hints, game.level.max_hints + 1,
+             "通过" if hint_ok else "失败"))
+
     game.restart_level()
     restart_ok = (game.state == STATE_PLAY and game.level.remaining == game.level.total
-                  and game.level.mistakes_left == game.level.max_mistakes)
+                  and game.level.mistakes_left == game.level.max_mistakes
+                  and game.level.hints_left == game.level.max_hints)
     ok &= restart_ok
     print("  重新开始恢复初始状态：%s" % ("通过" if restart_ok else "失败"))
 
@@ -1176,6 +1309,12 @@ def run_shots(scale=None):
     game.click_cell(blocked)
     _step(game, 0.18)                       # 抓一帧撞击动画
     shot("06_撞击反馈.png")
+
+    game.start_level(3)
+    game.hover_pos = None
+    game.use_hint()
+    _step(game, 0.20)                       # 抓一帧：自动点掉的那一支正在飞出
+    shot("09_自动提示.png")
 
     game.start_level(1)
     for cell in find_solution(1):

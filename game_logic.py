@@ -23,6 +23,9 @@ DELTA = {
     RIGHT: (0, 1),
 }
 
+# 每关默认的提示次数，可以在关卡数据里用 "hints" 字段单独覆盖。
+HINTS_PER_LEVEL = 2
+
 CHAR_TO_DIR = {"^": UP, "v": DOWN, "<": LEFT, ">": RIGHT}
 DIR_TO_CHAR = {v: k for k, v in CHAR_TO_DIR.items()}
 DIR_TO_NAME = {UP: "上", DOWN: "下", LEFT: "左", RIGHT: "右"}
@@ -102,6 +105,7 @@ class LevelState:
         self.rows, self.cols, self._initial = parse_level(self.defn)
         self.total = len(self._initial)
         self.max_mistakes = self.defn["mistakes"]
+        self.max_hints = self.defn.get("hints", HINTS_PER_LEVEL)
         self.reset()
 
     # -------- 生命周期
@@ -111,6 +115,7 @@ class LevelState:
         self.arrows = dict(self._initial)
         self.mistakes_left = self.max_mistakes
         self.mistakes_used = 0
+        self.hints_left = self.max_hints
         self.cleared = 0
 
     # -------- 查询
@@ -140,6 +145,28 @@ class LevelState:
         return path_cells(self.rows, self.cols, pos, direction)
 
     # -------- 操作
+
+    def find_hint(self):
+        """找出一支当前就能飞出棋盘的箭头，返回它的坐标；一支都没有则返回 None。
+
+        注意：按本关规则，移除箭头只会解开阻挡、永远不会制造阻挡，
+        所以任何一支"前方畅通"的箭头点掉都不会让关卡变成死局 —— 提示给哪一支都是安全的。
+        这里按行列顺序取第一支，保证同一局面下提示结果稳定可复现。
+        """
+        for pos in sorted(self.arrows):
+            if self.blocker_of(pos) is None:
+                return pos
+        return None
+
+    def use_hint(self):
+        """消耗一次提示机会并返回被提示的箭头坐标；没有机会或没有可点的箭头则返回 None。"""
+        if self.hints_left <= 0:
+            return None
+        pos = self.find_hint()
+        if pos is None:
+            return None
+        self.hints_left -= 1
+        return pos
 
     def click(self, pos):
         """点击一个格子，返回 ClickResult。这里是唯一的规则入口。"""
