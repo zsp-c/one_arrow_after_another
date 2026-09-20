@@ -68,6 +68,34 @@ def enable_high_dpi():
             pass
 
 
+def disable_ime():
+    """把中文输入法从游戏窗口上摘掉，必须在 set_mode() 之后调用。
+
+    这个游戏完全不需要文字输入，但输入法（微软拼音等）挂在窗口上时会截走字母键，
+    于是按 R / H 时 pygame 根本收不到 KEYDOWN —— 而 Esc、方向键这类非字母键不受影响，
+    表现为"有些键好用、字母键全都没反应"。
+    摘掉输入法上下文后字母键就恢复正常。非 Windows 平台直接跳过。
+
+    返回 True 表示原本确实挂着输入法、已经摘掉。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        pygame.key.stop_text_input()          # 让 SDL 也不再处理输入法
+    except Exception:
+        pass
+    try:
+        from ctypes import wintypes
+        hwnd = pygame.display.get_wm_info()["window"]
+        imm32 = ctypes.WinDLL("imm32")
+        imm32.ImmAssociateContext.argtypes = [wintypes.HWND, wintypes.HANDLE]
+        imm32.ImmAssociateContext.restype = wintypes.HANDLE
+        old = imm32.ImmAssociateContext(hwnd, None)
+        return bool(old)
+    except Exception:
+        return False
+
+
 def screen_work_area():
     """显示器可用区域（物理像素，已扣掉任务栏）。"""
     if sys.platform == "win32":
@@ -706,6 +734,8 @@ class Game:
                     self.go_menu()
                 return
             if event.key == pygame.K_r:
+                # pygame 没有 K_R 这种大写常量，按住 Shift 时 key 仍然是 K_r
+                # （只有 unicode 会变成 "R"），所以这里不需要额外判断大写。
                 if self.state in (STATE_PLAY, STATE_WIN, STATE_OVER):
                     self.restart_level()
                 return
@@ -1135,12 +1165,15 @@ def wrap_text(text, size, max_width):
 # ---------------------------------------------------------------- 主循环
 
 def start_display(explicit_scale=None, caption="一箭又一箭"):
-    """统一的启动流程：声明 DPI 感知 -> 初始化 -> 按屏幕算出缩放 -> 建窗口。"""
+    """统一的启动流程：声明 DPI 感知 -> 初始化 -> 按屏幕算出缩放 -> 建窗口 -> 摘掉输入法。"""
     enable_high_dpi()
     pygame.init()
     pygame.display.set_caption(caption)
     init_ui(compute_scale(explicit_scale))
-    return pygame.display.set_mode((WIDTH, HEIGHT))
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    # 必须在窗口建好之后：中文输入法会截走字母键，导致 R / H 收不到
+    disable_ime()
+    return screen
 
 
 def run():
@@ -1166,6 +1199,32 @@ def run():
 def _step(game, seconds):
     for _ in range(int(seconds * 60)):
         game.update(1.0 / 60)
+
+
+def _wait_idle(game, limit=600):
+    """一直推进到没有会锁输入的动画为止。"""
+    guard = 0
+    while game.busy() and guard < limit:
+        _step(game, 1.0 / 60)
+        guard += 1
+
+
+def _press(game, key):
+    game.handle_event(pygame.event.Event(pygame.KEYDOWN, key=key))
+
+
+def _scramble(game, index):
+    """把一关搞乱：飞出一支、再故意撞一次。返回被挡住的格子坐标。"""
+    game.start_level(index)
+    game.click_cell(find_solution(index)[0])
+    _wait_idle(game)
+    blocked = next(c for c in sorted(game.level.arrows) if game.level.blocker_of(c))
+    game.click_cell(blocked)
+    _wait_idle(game)
+    return blocked
+
+
+
 
 
 def run_auto(scale=None):
@@ -1254,12 +1313,68 @@ def run_auto(scale=None):
           % (game.level.max_hints, game.level.max_hints + 1,
              "通过" if hint_ok else "失败"))
 
-    game.restart_level()
-    restart_ok = (game.state == STATE_PLAY and game.level.remaining == game.level.total
-                  and game.level.mistakes_left == game.level.max_mistakes
-                  and game.level.hints_left == game.level.max_hints)
+    # R 重开（以及「重新开始本关」按钮）：游戏中 / 通关页 / 失败页三种状态下都要能复原
+    def restored():
+        return (game.state == STATE_PLAY
+                and game.level.remaining == game.level.total
+                and game.level.mistakes_left == game.level.max_mistakes
+                and game.level.mistakes_used == 0
+                and game.level.hints_left == game.level.max_hints
+                and not game.anims)
+
+    restart_ok = True
+    for scene in ("游戏中", "通关页", "失败页"):
+        blocked = _scramble(game, 1)
+        if scene == "通关页":
+            for cell in find_solution(1):
+                if cell in game.level.arrows:
+                    game.click_cell(cell)
+                    _wait_idle(game)
+        elif scene == "失败页":
+            for _ in range(game.level.max_mistakes):
+                if game.level.blocker_of(blocked) is None:
+                    blocked = next(c for c in sorted(game.level.arrows)
+                                   if game.level.blocker_of(c))
+                game.click_cell(blocked)
+                _wait_idle(game)
+        _wait_idle(game)
+        if scene == "失败页" and game.state != STATE_OVER:
+            restart_ok = False
+        broke = (game.level.remaining == game.level.total
+                 and game.level.mistakes_left == game.level.max_mistakes)
+        _press(game, pygame.K_r)
+        if not restored() or broke:
+            restart_ok = False
+        print("  按 R 重开（%s 时按下，局面已打乱）-> 状态 %s，箭头 %d/%d，失误 %d/%d，提示 %d/%d"
+              % (scene, game.state, game.level.remaining, game.level.total,
+                 game.level.mistakes_left, game.level.max_mistakes,
+                 game.level.hints_left, game.level.max_hints))
+
+    # 按钮路径
+    _scramble(game, 1)
+    button = next(b for b in game.buttons
+                  if "重新开始" in (b.label() if callable(b.label) else b.label))
+    game.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN,
+                                         pos=button.rect.center, button=1))
+    game.handle_event(pygame.event.Event(pygame.MOUSEBUTTONUP,
+                                         pos=button.rect.center, button=1))
+    button_ok = restored()
+    restart_ok &= button_ok
     ok &= restart_ok
-    print("  重新开始恢复初始状态：%s" % ("通过" if restart_ok else "失败"))
+    print("  「重新开始本关」按钮同样能复原：%s" % ("通过" if button_ok else "失败"))
+
+    # 动画播放到一半时按 R，也要能干净地打断
+    game.start_level(1)
+    game.click_cell(find_solution(1)[0])
+    if not game.busy():
+        restart_ok = False
+    _press(game, pygame.K_r)
+    interrupt_ok = restored()
+    restart_ok &= interrupt_ok
+    ok &= restart_ok
+    print("  飞出动画中按 R 能打断并复原：%s" % ("通过" if interrupt_ok else "失败"))
+
+    print("  R 重开功能总计：%s" % ("通过" if restart_ok else "失败"))
 
     pygame.quit()
     print("\n自动试玩结果：%s" % ("全部通过" if ok else "存在失败项"))

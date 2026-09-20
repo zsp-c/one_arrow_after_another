@@ -187,16 +187,13 @@ class LevelState:
 
 # ---------------------------------------------------------------- 求解器
 
-def find_solution(index, arrows=None):
+def find_solution(index):
     """深度优先搜索一条零失误的通关顺序。
 
     返回 [(r, c), ...]（按点击先后排列）；无解返回 None。
     箭头数量很少（<= 12），直接穷举即可。
     """
-    if arrows is None:
-        rows, cols, arrows = parse_level(LEVELS[index])
-    else:
-        rows, cols = LEVELS[index]["rows"], LEVELS[index]["cols"]
+    rows, cols, arrows = parse_level(LEVELS[index])
 
     order = []
     failed_states = set()
